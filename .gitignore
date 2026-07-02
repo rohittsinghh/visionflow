@@ -1,12 +1,61 @@
+# -----------------------------
+# Local environment / secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------------
+# Python / virtualenv / caches
+# -----------------------------
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# -----------------------------
+# OS / editor noise
+# -----------------------------
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# -----------------------------
+# Logs and runtime state
+# -----------------------------
 *.log
-.env
+logs/
+data/
+storage/
+
+# -----------------------------
+# Generated media / local inputs
+# -----------------------------
 videos/
 *.mp4
 *.mov
 *.avi
-data/
-crops
+*.mkv
+
+# -----------------------------
+# Large local model artifacts
+# Keep lightweight/exported model files in models/ only when intentional.
+# -----------------------------
+*.pt
+*.pth
+*.weights
+
+# -----------------------------
+# Temporary files
+# -----------------------------
+tmp/
+temp/
+*.tmp
