@@ -402,31 +402,3 @@ Run unit tests:
 ```bash
 .venv/bin/python -m pytest tests
 ```
-
-## Current Limitations
-
-- Each camera loads its own YOLO worker and model instance, which is simple but memory-heavy.
-- Multi-camera support currently treats video files as camera sources; RTSP support should work if OpenCV can open the stream, but it has not been hardened.
-- Pending in-memory DB batches can be lost if the process crashes before a flush.
-- Local crop storage is not durable object storage yet.
-- Fixed shared-memory names assume a single local app instance, not multiple uvicorn workers.
-
-## Good Next Improvements
-
-- Shared inference worker pool or GPU batch inference
-- RTSP reconnect/backoff handling
-- Redis Streams or Kafka for event fanout
-- MinIO/S3 crop storage backend
-- Alembic migrations
-- Prometheus metrics endpoint
-- JWT/API key management
-- CI with test and lint jobs
-- Load testing for multi-camera workloads
-
-## Resume Highlights
-
-- Built a real-time video analytics backend using FastAPI, multiprocessing, shared-memory ring buffers, and ONNX YOLO inference.
-- Implemented MJPEG annotated-frame streaming and SSE detection events with shared-latest fanout semantics.
-- Designed PostgreSQL persistence for detection metadata, pipeline runs, and first-appearance crop artifacts.
-- Added SQLAlchemy async pooling, batch writes, retry-file fallback, API key auth, health checks, metrics, and Docker Compose deployment.
-- Extended the system to support multiple independent camera pipelines with camera-scoped buffers, streams, storage, and database rows.
