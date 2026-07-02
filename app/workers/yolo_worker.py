@@ -53,7 +53,7 @@ def crop_detection(frame, bbox):
     return frame[y1:y2, x1:x2].copy()
 
 
-def create_first_appearance_event(run_id, frame_id, frame, detection):
+def create_first_appearance_event(camera_id, run_id, frame_id, frame, detection):
     """
     Save the first detected crop for a class and build an event payload.
     """
@@ -65,10 +65,10 @@ def create_first_appearance_event(run_id, frame_id, frame, detection):
 
     class_name = detection["class_name"]
     safe_class_name = safe_filename_part(class_name)
-    storage_service.ensure_crop_dir(run_id)
+    storage_service.ensure_crop_dir(camera_id, run_id)
 
     crop_filename = f"{frame_id}_{safe_class_name}.jpg"
-    crop_path = storage_service.crop_path(run_id, crop_filename)
+    crop_path = storage_service.crop_path(camera_id, run_id, crop_filename)
 
     success = cv2.imwrite(str(crop_path), crop)
 
@@ -77,13 +77,14 @@ def create_first_appearance_event(run_id, frame_id, frame, detection):
 
     return {
         "run_id": run_id,
+        "camera_id": camera_id,
         "frame": frame_id,
         "class_id": detection["class_id"],
         "class_name": class_name,
         "confidence": detection["confidence"],
         "bbox": detection["bbox"],
         "crop_path": str(crop_path),
-        "crop_url": storage_service.crop_url(run_id, crop_filename),
+        "crop_url": storage_service.crop_url(camera_id, run_id, crop_filename),
     }
 
 
@@ -166,6 +167,7 @@ def yolo_worker(
     result_queue,
     first_appearance_queue,
     run_id: str,
+    camera_id: str = "default",
 ):
     """
     Read frames from the ring buffer, run YOLO inference, and send detection
@@ -207,7 +209,12 @@ def yolo_worker(
     )
     seen_classes = set()
 
-    logger.info("yolo_worker_started run_id=%s model_path=%s", run_id, model_path)
+    logger.info(
+        "yolo_worker_started camera_id=%s run_id=%s model_path=%s",
+        camera_id,
+        run_id,
+        model_path,
+    )
 
     try:
         while True:
@@ -223,6 +230,7 @@ def yolo_worker(
 
                 result_queue.put(
                     {
+                        "camera_id": camera_id,
                         "run_id": run_id,
                         "frame": frame_id,
                         "detections": detections,
@@ -231,7 +239,8 @@ def yolo_worker(
 
                 if frame_id % LOG_EVERY_N_FRAMES == 0:
                     logger.info(
-                        "frame_processed run_id=%s frame_id=%s detections=%s",
+                        "frame_processed camera_id=%s run_id=%s frame_id=%s detections=%s",
+                        camera_id,
                         run_id,
                         frame_id,
                         len(detections),
@@ -242,6 +251,7 @@ def yolo_worker(
 
                     if class_name not in seen_classes:
                         crop_event = create_first_appearance_event(
+                            camera_id,
                             run_id,
                             frame_id,
                             frame,
@@ -253,9 +263,10 @@ def yolo_worker(
                             first_appearance_queue.put(crop_event)
                             logger.info(
                                 "first_appearance run_id=%s frame_id=%s "
-                                "class_name=%s confidence=%.2f crop_url=%s",
+                                "camera_id=%s class_name=%s confidence=%.2f crop_url=%s",
                                 run_id,
                                 frame_id,
+                                camera_id,
                                 class_name,
                                 detection["confidence"],
                                 crop_event["crop_url"],
@@ -267,4 +278,4 @@ def yolo_worker(
     finally:
         ring_buffer.close()
         annotated_ring_buffer.close()
-        logger.info("yolo_worker_finished run_id=%s", run_id)
+        logger.info("yolo_worker_finished camera_id=%s run_id=%s", camera_id, run_id)

@@ -18,23 +18,13 @@ def health():
     Return service health and worker state.
     """
 
-    video_alive = (
-        pipeline_service.video_process is not None
-        and pipeline_service.video_process.is_alive()
-    )
-    yolo_alive = (
-        pipeline_service.yolo_process is not None
-        and pipeline_service.yolo_process.is_alive()
-    )
+    cameras = pipeline_service.list_cameras()["items"]
 
     return {
         "status": "ok",
         "database_configured": connection.is_configured(),
-        "run_id": pipeline_service.current_run_id,
-        "workers": {
-            "video_reader_alive": video_alive,
-            "yolo_worker_alive": yolo_alive,
-        },
+        "active_camera_count": len(cameras),
+        "cameras": cameras,
     }
 
 

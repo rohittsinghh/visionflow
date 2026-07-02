@@ -1,11 +1,15 @@
 """
 Pipeline service.
 
-This module owns the long-lived runtime objects used by the video pipeline:
-worker processes and shared-memory ring buffers.
+This module owns runtime pipeline objects. In v1 multi-camera mode, each
+camera id maps to an isolated pair of worker processes and ring buffers. Local
+video files are treated as camera sources so the same API shape can later
+accept RTSP URLs or webcam indexes.
 """
 
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Process
 
@@ -17,51 +21,84 @@ from app.workers.video_reader import read_video
 from app.workers.yolo_worker import yolo_worker
 
 
+DEFAULT_CAMERA_ID = "default"
 VIDEO_PATH = "videos/sample.mp4"
 MODEL_PATH = "models/yolov8n.onnx"
-
 FRAME_SHAPE = (480, 640, 3)
 BUFFER_SIZE = 4
+
 logger = logging.getLogger(__name__)
+camera_pipelines = {}
 
 
-video_process = None
-yolo_process = None
-ring_buffer = None
-annotated_ring_buffer = None
-current_run_id = None
+@dataclass
+class CameraPipelineState:
+    camera_id: str
+    source: str
+    run_id: str
+    shared_memory_names: dict
+    raw_ring_buffer: RingBuffer
+    annotated_ring_buffer: RingBuffer
+    video_process: Process | None = None
+    yolo_process: Process | None = None
 
 
-def build_shared_memory_names():
+def sanitize_camera_id(camera_id):
     """
-    Build fixed shared memory names for the local pipeline.
-
-    The names are intentionally short because some platforms, including
-    macOS, enforce a small POSIX shared memory name limit. Reusing fixed
-    names is convenient for local debugging because the names are stable
-    across server restarts.
+    Keep camera ids URL-friendly and usable in short shared memory names.
     """
+
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", camera_id.strip().lower())
+    return cleaned.strip("_") or DEFAULT_CAMERA_ID
+
+
+def shared_memory_tag(camera_id):
+    """
+    Return a short stable tag for POSIX shared memory names.
+    """
+
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "", camera_id.lower())
+    return (cleaned or "default")[:8]
+
+
+def build_shared_memory_names(camera_id):
+    """
+    Build short fixed shared memory names for one camera.
+    """
+
+    if sanitize_camera_id(camera_id) == DEFAULT_CAMERA_ID:
+        return {
+            "raw": {
+                "frame": "psm_yrf",
+                "ids": "psm_yri",
+                "status": "psm_yrs",
+            },
+            "annotated": {
+                "frame": "psm_yaf",
+                "ids": "psm_yai",
+                "status": "psm_yas",
+            },
+        }
+
+    tag = shared_memory_tag(camera_id)
 
     return {
         "raw": {
-            "frame": "psm_yrf",
-            "ids": "psm_yri",
-            "status": "psm_yrs",
+            "frame": f"psm_{tag}_rf",
+            "ids": f"psm_{tag}_ri",
+            "status": f"psm_{tag}_rs",
         },
         "annotated": {
-            "frame": "psm_yaf",
-            "ids": "psm_yai",
-            "status": "psm_yas",
+            "frame": f"psm_{tag}_af",
+            "ids": f"psm_{tag}_ai",
+            "status": f"psm_{tag}_as",
         },
     }
 
 
-SHARED_MEMORY_NAMES = build_shared_memory_names()
-
-
-def flatten_shared_memory_names(name_map=SHARED_MEMORY_NAMES):
+def flatten_shared_memory_names(name_map):
     """
-    Return all configured shared memory names.
+    Return all shared memory names from a camera name map.
     """
 
     return [
@@ -74,81 +111,93 @@ def flatten_shared_memory_names(name_map=SHARED_MEMORY_NAMES):
     ]
 
 
-def cleanup_configured_shared_memory():
+def cleanup_configured_shared_memory(camera_id):
     """
-    Unlink this app's fixed shared memory blocks when they already exist.
-
-    This is safe before creating a new local pipeline because start_pipeline()
-    first verifies that the current process is not already running a pipeline.
-    It should not be used as a broad system cleanup command for unrelated
-    processes.
+    Unlink this camera's fixed shared memory blocks when they already exist.
     """
 
-    return cleanup_shared_memory_names(flatten_shared_memory_names())
+    return cleanup_shared_memory_names(
+        flatten_shared_memory_names(build_shared_memory_names(camera_id))
+    )
 
 
-def cleanup_pipeline():
+def is_process_alive(process):
     """
-    Stop worker processes and release shared memory.
+    Return whether a process exists and is alive.
     """
 
-    global video_process
-    global yolo_process
-    global ring_buffer
-    global annotated_ring_buffer
-    global current_run_id
+    return process is not None and process.is_alive()
 
-    for process in (video_process, yolo_process):
-        if process is not None and process.is_alive():
+
+def cleanup_camera_pipeline(camera_id):
+    """
+    Stop one camera pipeline and release its shared memory.
+    """
+
+    camera_id = sanitize_camera_id(camera_id)
+    state = camera_pipelines.get(camera_id)
+
+    if state is None:
+        cleanup_configured_shared_memory(camera_id)
+        return None
+
+    for process in (state.video_process, state.yolo_process):
+        if is_process_alive(process):
             process.terminate()
             process.join(timeout=2)
 
-    video_process = None
-    yolo_process = None
-
-    if ring_buffer is not None:
+    for buffer_name, ring_buffer in (
+        ("raw", state.raw_ring_buffer),
+        ("annotated", state.annotated_ring_buffer),
+    ):
         try:
             ring_buffer.close()
             ring_buffer.unlink()
         except Exception:
-            logger.exception("ring_buffer_cleanup_failed")
+            logger.exception(
+                "ring_buffer_cleanup_failed camera_id=%s buffer=%s",
+                camera_id,
+                buffer_name,
+            )
 
-        ring_buffer = None
-
-    if annotated_ring_buffer is not None:
-        try:
-            annotated_ring_buffer.close()
-            annotated_ring_buffer.unlink()
-        except Exception:
-            logger.exception("annotated_ring_buffer_cleanup_failed")
-
-        annotated_ring_buffer = None
-
-    cleanup_configured_shared_memory()
-    current_run_id = None
+    cleanup_shared_memory_names(
+        flatten_shared_memory_names(state.shared_memory_names)
+    )
+    camera_pipelines.pop(camera_id, None)
+    return state
 
 
-def start_pipeline():
+def cleanup_pipeline():
     """
-    Start the video reader and YOLO worker processes.
+    Stop all camera pipelines. Kept for FastAPI shutdown compatibility.
     """
 
-    global video_process
-    global yolo_process
-    global ring_buffer
-    global annotated_ring_buffer
-    global current_run_id
+    for camera_id in list(camera_pipelines):
+        cleanup_camera_pipeline(camera_id)
 
-    if video_process is not None and video_process.is_alive():
+
+def start_camera_pipeline(camera_id=DEFAULT_CAMERA_ID, source=VIDEO_PATH):
+    """
+    Start one camera pipeline.
+    """
+
+    camera_id = sanitize_camera_id(camera_id)
+
+    existing_state = camera_pipelines.get(camera_id)
+
+    if existing_state is not None and is_process_alive(existing_state.video_process):
         return {
-            "message": "Video pipeline already running.",
+            "message": "Camera pipeline already running.",
+            "camera_id": camera_id,
+            "run_id": existing_state.run_id,
         }
 
-    cleanup_pipeline()
-    name_map = SHARED_MEMORY_NAMES
-    current_run_id = datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_%f")
+    cleanup_camera_pipeline(camera_id)
+    name_map = build_shared_memory_names(camera_id)
+    cleanup_configured_shared_memory(camera_id)
+    run_id = datetime.utcnow().strftime("run_%Y%m%d_%H%M%S_%f")
 
-    ring_buffer = RingBuffer(
+    raw_ring_buffer = RingBuffer(
         frame_shape=FRAME_SHAPE,
         buffer_size=BUFFER_SIZE,
         frame_shm_name=name_map["raw"]["frame"],
@@ -169,16 +218,16 @@ def start_pipeline():
     video_process = Process(
         target=read_video,
         args=(
-            VIDEO_PATH,
+            source,
             FRAME_SHAPE,
             BUFFER_SIZE,
-            ring_buffer.frame_shm_name,
-            ring_buffer.id_shm_name,
-            ring_buffer.status_shm_name,
-            ring_buffer.write_index,
-            ring_buffer.read_index,
-            ring_buffer.next_frame_id,
-            ring_buffer.lock,
+            raw_ring_buffer.frame_shm_name,
+            raw_ring_buffer.id_shm_name,
+            raw_ring_buffer.status_shm_name,
+            raw_ring_buffer.write_index,
+            raw_ring_buffer.read_index,
+            raw_ring_buffer.next_frame_id,
+            raw_ring_buffer.lock,
         ),
     )
 
@@ -187,13 +236,13 @@ def start_pipeline():
         args=(
             FRAME_SHAPE,
             BUFFER_SIZE,
-            ring_buffer.frame_shm_name,
-            ring_buffer.id_shm_name,
-            ring_buffer.status_shm_name,
-            ring_buffer.write_index,
-            ring_buffer.read_index,
-            ring_buffer.next_frame_id,
-            ring_buffer.lock,
+            raw_ring_buffer.frame_shm_name,
+            raw_ring_buffer.id_shm_name,
+            raw_ring_buffer.status_shm_name,
+            raw_ring_buffer.write_index,
+            raw_ring_buffer.read_index,
+            raw_ring_buffer.next_frame_id,
+            raw_ring_buffer.lock,
             annotated_ring_buffer.frame_shm_name,
             annotated_ring_buffer.id_shm_name,
             annotated_ring_buffer.status_shm_name,
@@ -204,68 +253,138 @@ def start_pipeline():
             MODEL_PATH,
             result_queue,
             first_appearance_queue,
-            current_run_id,
+            run_id,
+            camera_id,
         ),
     )
+
+    state = CameraPipelineState(
+        camera_id=camera_id,
+        source=source,
+        run_id=run_id,
+        shared_memory_names=name_map,
+        raw_ring_buffer=raw_ring_buffer,
+        annotated_ring_buffer=annotated_ring_buffer,
+        video_process=video_process,
+        yolo_process=yolo_process,
+    )
+    camera_pipelines[camera_id] = state
 
     video_process.start()
     yolo_process.start()
     logger.info(
-        "pipeline_started run_id=%s video_path=%s model_path=%s",
-        current_run_id,
-        VIDEO_PATH,
+        "camera_pipeline_started camera_id=%s run_id=%s source=%s model_path=%s",
+        camera_id,
+        run_id,
+        source,
         MODEL_PATH,
     )
 
     return {
         "message": "Video reader and YOLO worker started successfully.",
-        "run_id": current_run_id,
+        "camera_id": camera_id,
+        "run_id": run_id,
+        "source": source,
+    }
+
+
+def start_pipeline():
+    """
+    Legacy single-camera start endpoint.
+    """
+
+    return start_camera_pipeline(DEFAULT_CAMERA_ID, VIDEO_PATH)
+
+
+def stop_camera_pipeline(camera_id=DEFAULT_CAMERA_ID):
+    """
+    Stop one camera pipeline.
+    """
+
+    camera_id = sanitize_camera_id(camera_id)
+    state = camera_pipelines.get(camera_id)
+
+    if state is None:
+        return {
+            "message": "Camera pipeline is not running.",
+            "camera_id": camera_id,
+        }
+
+    run_id = state.run_id
+    cleanup_camera_pipeline(camera_id)
+    logger.info("camera_pipeline_stopped camera_id=%s run_id=%s", camera_id, run_id)
+
+    return {
+        "message": "Video pipeline stopped successfully.",
+        "camera_id": camera_id,
+        "run_id": run_id,
     }
 
 
 def stop_pipeline():
     """
-    Stop the video pipeline if it exists.
+    Legacy single-camera stop endpoint.
     """
 
-    if (
-        ring_buffer is None
-        and annotated_ring_buffer is None
-        and video_process is None
-        and yolo_process is None
-    ):
-        return {
-            "message": "Video pipeline is not running.",
-        }
+    return stop_camera_pipeline(DEFAULT_CAMERA_ID)
 
-    stopped_run_id = current_run_id
-    cleanup_pipeline()
-    logger.info("pipeline_stopped run_id=%s", stopped_run_id)
+
+def camera_snapshot(state):
+    """
+    Return one camera pipeline snapshot.
+    """
 
     return {
-        "message": "Video pipeline stopped successfully.",
+        "camera_id": state.camera_id,
+        "source": state.source,
+        "run_id": state.run_id,
+        "video_reader_alive": is_process_alive(state.video_process),
+        "yolo_worker_alive": is_process_alive(state.yolo_process),
+    }
+
+
+def list_cameras():
+    """
+    Return all known active camera pipelines.
+    """
+
+    return {
+        "items": [
+            camera_snapshot(state)
+            for state in camera_pipelines.values()
+        ]
+    }
+
+
+def get_camera_buffer_status(camera_id=DEFAULT_CAMERA_ID):
+    """
+    Return raw and annotated ring buffer metadata for one camera.
+    """
+
+    camera_id = sanitize_camera_id(camera_id)
+    state = camera_pipelines.get(camera_id)
+
+    if state is None:
+        return {
+            "message": "Camera pipeline has not been started.",
+            "camera_id": camera_id,
+        }
+
+    return {
+        "camera_id": camera_id,
+        "source": state.source,
+        "raw": state.raw_ring_buffer.snapshot(),
+        "annotated": state.annotated_ring_buffer.snapshot(),
+        "run_id": state.run_id,
     }
 
 
 def get_buffer_status():
     """
-    Return raw and annotated ring buffer metadata.
+    Legacy default-camera buffer status.
     """
 
-    if ring_buffer is None:
-        return {
-            "message": "Video pipeline has not been started.",
-        }
-
-    return {
-        "raw": ring_buffer.snapshot(),
-        "annotated": (
-            annotated_ring_buffer.snapshot()
-            if annotated_ring_buffer is not None
-            else None
-        ),
-        "run_id": current_run_id,
-    }
+    return get_camera_buffer_status(DEFAULT_CAMERA_ID)
 
 
 def calculate_buffer_fill(snapshot):
@@ -285,37 +404,51 @@ def calculate_buffer_fill(snapshot):
 
 def get_pipeline_metrics():
     """
-    Return worker and ring buffer metrics.
+    Return worker and ring buffer metrics for all cameras.
     """
 
-    raw_snapshot = ring_buffer.snapshot() if ring_buffer is not None else None
-    annotated_snapshot = (
-        annotated_ring_buffer.snapshot()
-        if annotated_ring_buffer is not None
-        else None
-    )
+    cameras = {}
+
+    for camera_id, state in camera_pipelines.items():
+        raw_snapshot = state.raw_ring_buffer.snapshot()
+        annotated_snapshot = state.annotated_ring_buffer.snapshot()
+        cameras[camera_id] = {
+            "run_id": state.run_id,
+            "source": state.source,
+            "workers": {
+                "video_reader_alive": is_process_alive(state.video_process),
+                "yolo_worker_alive": is_process_alive(state.yolo_process),
+            },
+            "buffers": {
+                "raw_fill": calculate_buffer_fill(raw_snapshot),
+                "annotated_fill": calculate_buffer_fill(annotated_snapshot),
+                "buffer_size": BUFFER_SIZE,
+            },
+        }
 
     return {
-        "run_id": current_run_id,
-        "workers": {
-            "video_reader_alive": (
-                video_process is not None and video_process.is_alive()
-            ),
-            "yolo_worker_alive": (
-                yolo_process is not None and yolo_process.is_alive()
-            ),
-        },
-        "buffers": {
-            "raw_fill": calculate_buffer_fill(raw_snapshot),
-            "annotated_fill": calculate_buffer_fill(annotated_snapshot),
-            "buffer_size": BUFFER_SIZE,
-        },
+        "camera_count": len(camera_pipelines),
+        "cameras": cameras,
     }
 
 
-def get_annotated_ring_buffer():
+def get_annotated_ring_buffer(camera_id=DEFAULT_CAMERA_ID):
     """
-    Return the current annotated frame ring buffer.
+    Return one camera's annotated frame ring buffer.
     """
 
-    return annotated_ring_buffer
+    state = camera_pipelines.get(sanitize_camera_id(camera_id))
+
+    if state is None:
+        return None
+
+    return state.annotated_ring_buffer
+
+
+def get_current_run_id(camera_id=DEFAULT_CAMERA_ID):
+    """
+    Return one camera's current run id.
+    """
+
+    state = camera_pipelines.get(sanitize_camera_id(camera_id))
+    return state.run_id if state is not None else None

@@ -20,14 +20,16 @@ def test_create_first_appearance_event_uses_storage_style_path(tmp_path):
         }
 
         event = yolo_worker.create_first_appearance_event(
+            "front_gate",
             "run_test",
             42,
             frame,
             detection,
         )
 
+        assert event["camera_id"] == "front_gate"
         assert event["class_name"] == "city bus"
-        assert event["crop_url"] == "/crops/run_test/42_city_bus.jpg"
+        assert event["crop_url"] == "/crops/front_gate/run_test/42_city_bus.jpg"
         assert Path(event["crop_path"]).exists()
     finally:
         storage_service.CROP_ROOT = original_crop_root

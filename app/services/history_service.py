@@ -29,24 +29,32 @@ async def fetch_one(statement, params=None):
     return rows[0] if rows else None
 
 
-async def latest_detections(limit=20):
+async def latest_detections(limit=20, camera_id=None):
     """
     Return the newest detection rows.
     """
 
+    params = {"limit": limit}
+    where_sql = ""
+
+    if camera_id:
+        where_sql = "WHERE camera_id = :camera_id"
+        params["camera_id"] = camera_id
+
     return await fetch_all(
-        """
-        SELECT id, run_id, frame_id, class_id, class_name, confidence,
+        f"""
+        SELECT id, camera_id, run_id, frame_id, class_id, class_name, confidence,
                x1, y1, x2, y2, created_at
         FROM detections
+        {where_sql}
         ORDER BY id DESC
         LIMIT :limit
         """,
-        {"limit": limit},
+        params,
     )
 
 
-async def detection_history(class_name=None, run_id=None, limit=100):
+async def detection_history(class_name=None, run_id=None, camera_id=None, limit=100):
     """
     Return detection history with optional filters.
     """
@@ -62,11 +70,15 @@ async def detection_history(class_name=None, run_id=None, limit=100):
         filters.append("run_id = :run_id")
         params["run_id"] = run_id
 
+    if camera_id:
+        filters.append("camera_id = :camera_id")
+        params["camera_id"] = camera_id
+
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
     return await fetch_all(
         f"""
-        SELECT id, run_id, frame_id, class_id, class_name, confidence,
+        SELECT id, camera_id, run_id, frame_id, class_id, class_name, confidence,
                x1, y1, x2, y2, created_at
         FROM detections
         {where_sql}
@@ -77,21 +89,27 @@ async def detection_history(class_name=None, run_id=None, limit=100):
     )
 
 
-async def first_appearance_history(run_id=None, limit=100):
+async def first_appearance_history(run_id=None, camera_id=None, limit=100):
     """
     Return first-appearance crop metadata.
     """
 
     params = {"limit": limit}
-    where_sql = ""
+    filters = []
 
     if run_id:
-        where_sql = "WHERE run_id = :run_id"
+        filters.append("run_id = :run_id")
         params["run_id"] = run_id
+
+    if camera_id:
+        filters.append("camera_id = :camera_id")
+        params["camera_id"] = camera_id
+
+    where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
 
     return await fetch_all(
         f"""
-        SELECT id, run_id, frame_id, class_id, class_name, confidence,
+        SELECT id, camera_id, run_id, frame_id, class_id, class_name, confidence,
                x1, y1, x2, y2, crop_path, crop_url, created_at
         FROM first_appearance_crops
         {where_sql}
@@ -109,23 +127,27 @@ async def run_summary(run_id):
 
     return await fetch_one(
         """
-        SELECT r.run_id, r.status, r.started_at, r.stopped_at,
+        SELECT r.run_id, r.camera_id, r.status, r.started_at, r.stopped_at,
                r.video_path, r.model_path,
                COUNT(d.id) AS detection_rows,
                COUNT(DISTINCT d.class_name) AS detection_classes,
                COUNT(DISTINCT c.class_name) AS first_appearance_classes
         FROM pipeline_runs r
-        LEFT JOIN detections d ON d.run_id = r.run_id
-        LEFT JOIN first_appearance_crops c ON c.run_id = r.run_id
+        LEFT JOIN detections d
+            ON d.run_id = r.run_id
+            AND d.camera_id = r.camera_id
+        LEFT JOIN first_appearance_crops c
+            ON c.run_id = r.run_id
+            AND c.camera_id = r.camera_id
         WHERE r.run_id = :run_id
         GROUP BY r.run_id, r.status, r.started_at, r.stopped_at,
-                 r.video_path, r.model_path
+                 r.camera_id, r.video_path, r.model_path
         """,
         {"run_id": run_id},
     )
 
 
-async def create_run(run_id, video_path, model_path):
+async def create_run(camera_id, run_id, video_path, model_path):
     """
     Insert a running pipeline run record.
     """
@@ -137,10 +159,23 @@ async def create_run(run_id, video_path, model_path):
         await session.execute(
             text(
                 """
-                INSERT INTO pipeline_runs (run_id, status, video_path, model_path)
-                VALUES (:run_id, 'running', :video_path, :model_path)
+                INSERT INTO pipeline_runs (
+                    run_id,
+                    camera_id,
+                    status,
+                    video_path,
+                    model_path
+                )
+                VALUES (
+                    :run_id,
+                    :camera_id,
+                    'running',
+                    :video_path,
+                    :model_path
+                )
                 ON CONFLICT (run_id) DO UPDATE
                 SET status = 'running',
+                    camera_id = EXCLUDED.camera_id,
                     stopped_at = NULL,
                     video_path = EXCLUDED.video_path,
                     model_path = EXCLUDED.model_path
@@ -148,6 +183,7 @@ async def create_run(run_id, video_path, model_path):
             ),
             {
                 "run_id": run_id,
+                "camera_id": camera_id,
                 "video_path": video_path,
                 "model_path": model_path,
             },

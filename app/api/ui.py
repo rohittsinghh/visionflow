@@ -134,7 +134,7 @@ def first_appearances_page():
       }
 
       function renderCrop(eventData) {
-        const key = `${eventData.run_id}:${eventData.class_name}`;
+        const key = `${eventData.camera_id || "default"}:${eventData.run_id}:${eventData.class_name}`;
 
         if (seenKeys.has(key)) {
           return;
@@ -160,7 +160,7 @@ def first_appearances_page():
 
         const meta = document.createElement("p");
         meta.className = "crop-meta";
-        meta.textContent = `Frame ${eventData.frame} | Confidence ${Number(eventData.confidence).toFixed(2)} | ${eventData.run_id}`;
+        meta.textContent = `${eventData.camera_id || "default"} | Frame ${eventData.frame} | Confidence ${Number(eventData.confidence).toFixed(2)} | ${eventData.run_id}`;
 
         body.appendChild(title);
         body.appendChild(meta);

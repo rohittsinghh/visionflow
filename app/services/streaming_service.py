@@ -19,11 +19,21 @@ from app.services import pipeline_service
 
 
 queue_drain_task = None
-latest_detection = None
-latest_detection_event = asyncio.Event()
-latest_first_appearance = None
-first_appearance_events = []
-latest_first_appearance_event = asyncio.Event()
+latest_detection_by_camera = {}
+detection_events_by_camera = {}
+first_appearance_events_by_camera = {}
+first_appearance_signal_by_camera = {}
+
+
+def get_camera_event(event_map, camera_id):
+    """
+    Return the asyncio.Event used to wake streams for one camera.
+    """
+
+    if camera_id not in event_map:
+        event_map[camera_id] = asyncio.Event()
+
+    return event_map[camera_id]
 
 
 async def drain_detection_queue():
@@ -31,30 +41,44 @@ async def drain_detection_queue():
     Move worker detection results into shared FastAPI fanout state.
     """
 
-    global latest_detection
-    global latest_first_appearance
-    global first_appearance_events
+    global latest_detection_by_camera
+    global first_appearance_events_by_camera
 
     while True:
         try:
             while True:
-                latest_detection = result_queue.get_nowait()
-                metrics_service.record_detection_payload(latest_detection)
-                latest_detection_event.set()
+                detection_payload = result_queue.get_nowait()
+                camera_id = detection_payload.get(
+                    "camera_id",
+                    pipeline_service.DEFAULT_CAMERA_ID,
+                )
+                latest_detection_by_camera[camera_id] = detection_payload
+                metrics_service.record_detection_payload(detection_payload)
+                get_camera_event(detection_events_by_camera, camera_id).set()
                 await db_writer_service.enqueue_detection_payload(
-                    latest_detection
+                    detection_payload
                 )
         except Empty:
             pass
 
         try:
             while True:
-                latest_first_appearance = first_appearance_queue.get_nowait()
+                first_appearance_event = first_appearance_queue.get_nowait()
+                camera_id = first_appearance_event.get(
+                    "camera_id",
+                    pipeline_service.DEFAULT_CAMERA_ID,
+                )
                 metrics_service.record_first_appearance_event()
-                first_appearance_events.append(latest_first_appearance)
-                latest_first_appearance_event.set()
+                first_appearance_events_by_camera.setdefault(
+                    camera_id,
+                    [],
+                ).append(first_appearance_event)
+                get_camera_event(
+                    first_appearance_signal_by_camera,
+                    camera_id,
+                ).set()
                 await db_writer_service.enqueue_first_appearance_event(
-                    latest_first_appearance
+                    first_appearance_event
                 )
         except Empty:
             pass
@@ -78,9 +102,10 @@ async def stop_detection_fanout():
     """
 
     global queue_drain_task
-    global latest_detection
-    global latest_first_appearance
-    global first_appearance_events
+    global latest_detection_by_camera
+    global detection_events_by_camera
+    global first_appearance_events_by_camera
+    global first_appearance_signal_by_camera
 
     if queue_drain_task is not None:
         queue_drain_task.cancel()
@@ -92,31 +117,42 @@ async def stop_detection_fanout():
 
         queue_drain_task = None
 
-    latest_detection = None
-    latest_first_appearance = None
-    first_appearance_events = []
+    latest_detection_by_camera = {}
+    detection_events_by_camera = {}
+    first_appearance_events_by_camera = {}
+    first_appearance_signal_by_camera = {}
 
 
-def clear_latest_detection():
+def clear_latest_detection(camera_id=None):
     """
     Clear the latest detection payload.
     """
 
-    global latest_detection
+    global latest_detection_by_camera
 
-    latest_detection = None
+    if camera_id is None:
+        latest_detection_by_camera = {}
+        detection_events_by_camera.clear()
+        return
+
+    latest_detection_by_camera.pop(camera_id, None)
+    detection_events_by_camera.pop(camera_id, None)
 
 
-def clear_latest_first_appearance():
+def clear_latest_first_appearance(camera_id=None):
     """
     Clear the latest first-appearance crop event.
     """
 
-    global latest_first_appearance
-    global first_appearance_events
+    global first_appearance_events_by_camera
 
-    latest_first_appearance = None
-    first_appearance_events = []
+    if camera_id is None:
+        first_appearance_events_by_camera = {}
+        first_appearance_signal_by_camera.clear()
+        return
+
+    first_appearance_events_by_camera.pop(camera_id, None)
+    first_appearance_signal_by_camera.pop(camera_id, None)
 
 
 def encode_mjpeg_frame(frame):
@@ -137,17 +173,20 @@ def encode_mjpeg_frame(frame):
     )
 
 
-async def annotated_frame_generator():
+async def annotated_frame_generator(camera_id=pipeline_service.DEFAULT_CAMERA_ID):
     """
     Stream newest annotated frames without consuming them.
     """
 
+    camera_id = pipeline_service.sanitize_camera_id(camera_id)
     last_frame_id = -1
     metrics_service.increment_client("mjpeg")
 
     try:
         while True:
-            annotated_ring_buffer = pipeline_service.get_annotated_ring_buffer()
+            annotated_ring_buffer = pipeline_service.get_annotated_ring_buffer(
+                camera_id
+            )
 
             if annotated_ring_buffer is None:
                 await asyncio.sleep(0.05)
@@ -170,26 +209,30 @@ async def annotated_frame_generator():
         metrics_service.decrement_client("mjpeg")
 
 
-async def detection_event_generator():
+async def detection_event_generator(camera_id=pipeline_service.DEFAULT_CAMERA_ID):
     """
     Stream detection payloads as Server-Sent Events.
     """
 
+    camera_id = pipeline_service.sanitize_camera_id(camera_id)
     last_frame_id = -1
+    detection_event = get_camera_event(detection_events_by_camera, camera_id)
     metrics_service.increment_client("detections")
 
     try:
         while True:
+            latest_detection = latest_detection_by_camera.get(camera_id)
+
             if latest_detection is None:
-                await latest_detection_event.wait()
-                latest_detection_event.clear()
+                await detection_event.wait()
+                detection_event.clear()
                 continue
 
             frame_id = latest_detection.get("frame", -1)
 
             if frame_id <= last_frame_id:
-                await latest_detection_event.wait()
-                latest_detection_event.clear()
+                await detection_event.wait()
+                detection_event.clear()
                 continue
 
             last_frame_id = frame_id
@@ -200,19 +243,31 @@ async def detection_event_generator():
         metrics_service.decrement_client("detections")
 
 
-async def first_appearance_event_generator():
+async def first_appearance_event_generator(
+    camera_id=pipeline_service.DEFAULT_CAMERA_ID,
+):
     """
     Stream first-appearance crop events as Server-Sent Events.
     """
 
+    camera_id = pipeline_service.sanitize_camera_id(camera_id)
     next_event_index = 0
+    first_appearance_signal = get_camera_event(
+        first_appearance_signal_by_camera,
+        camera_id,
+    )
     metrics_service.increment_client("first_appearances")
 
     try:
         while True:
+            first_appearance_events = first_appearance_events_by_camera.get(
+                camera_id,
+                [],
+            )
+
             if next_event_index >= len(first_appearance_events):
-                await latest_first_appearance_event.wait()
-                latest_first_appearance_event.clear()
+                await first_appearance_signal.wait()
+                first_appearance_signal.clear()
                 continue
 
             event = first_appearance_events[next_event_index]

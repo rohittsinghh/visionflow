@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 INSERT_DETECTIONS_SQL = text("""
 INSERT INTO detections (
+    camera_id,
     run_id,
     frame_id,
     class_id,
@@ -42,6 +43,7 @@ INSERT INTO detections (
     y2
 )
 VALUES (
+    :camera_id,
     :run_id,
     :frame_id,
     :class_id,
@@ -56,6 +58,7 @@ VALUES (
 
 INSERT_FIRST_APPEARANCE_CROP_SQL = text("""
 INSERT INTO first_appearance_crops (
+    camera_id,
     run_id,
     frame_id,
     class_id,
@@ -69,6 +72,7 @@ INSERT INTO first_appearance_crops (
     crop_url
 )
 VALUES (
+    :camera_id,
     :run_id,
     :frame_id,
     :class_id,
@@ -81,7 +85,7 @@ VALUES (
     :crop_path,
     :crop_url
 )
-ON CONFLICT (run_id, class_name) DO NOTHING
+ON CONFLICT (camera_id, run_id, class_name) DO NOTHING
 """)
 
 
@@ -92,6 +96,7 @@ def flatten_detection_payload(payload):
 
     frame_id = payload.get("frame")
     run_id = payload.get("run_id")
+    camera_id = payload.get("camera_id", "default")
     rows = []
 
     for detection in payload.get("detections", []):
@@ -99,6 +104,7 @@ def flatten_detection_payload(payload):
 
         rows.append(
             {
+                "camera_id": camera_id,
                 "run_id": run_id,
                 "frame_id": frame_id,
                 "class_id": detection["class_id"],
@@ -122,6 +128,7 @@ def flatten_first_appearance_event(event):
     x1, y1, x2, y2 = event["bbox"]
 
     return {
+        "camera_id": event.get("camera_id", "default"),
         "run_id": event["run_id"],
         "frame_id": event["frame"],
         "class_id": event["class_id"],
